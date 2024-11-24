@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Video Processing Example</title>
+    <style>
+        html, body {
+          margin: 0;       /* remove the default margin          */
+          height: 100%;    /* make the html,body fill the page   */
+        }
+        canvas {
+          display: block;  /* make the canvas act like a block   */
+          width: 100%;     /* make the canvas fill its container */
+          height: 100%;
+        }
+        #start {
+          position: fixed;
+          left: 0;
+          top: 0;
+          width: 100%;
+          height: 100%;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+        }
+        #start>div {
+          font-size: 200px;
+          cursor: pointer;
+        }
+    </style>
+  </head>
+  <body>
+    <canvas id="webgpu-canvas"></canvas>
+    <pre id="fps">
+    </pre>
+    <div id="start">
+      <div>▶️</div>
+    </div>
+  </body>
+  <script type="importmap">
+  {
+      "imports": {
+          "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js",
+          "wgpu-matrix": "https://wgpu-matrix.org/dist/3.x/wgpu-matrix.module.js"
+      }
+  }
+  </script>
+
+
+  <script type="module">
+import {mat4} from "wgpu-matrix";
+import {GUI} from "lil-gui";
+
+// bindings & locations can be assigned arbitrarily.
+const binding_copy_tex_in = 2;
+const binding_copy_tex_out = 4;
+const binding_texquad_tex_out = 2;
+const binding_texquad_sampler = 4;
+const binding_texquad_uniform = 3;
+const loc_position = 5;
+const loc_inter_stage_uv = 1;
+
+const workgroup_size = [8, 8];
+
+const FILTER_NONE = "no filter";
+
+async function main() {
+
+    const adapter = await navigator.gpu?.requestAdapter();
+    const hasBGRA8unormStorage = adapter.features.has('bgra8unorm-storage');
+    const device = await adapter?.requestDevice();
+    if (!device) {
+        fail('need a browser that supports WebGPU');
+        return;
+    }
+    
+    const canvas = document.querySelector('#webgpu-canvas');
+    const context = canvas.getContext('webgpu');
+    const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device,
+        format: presentationFormat,
+    });
+
+    // create a typedarray to hold the a 4x4 f32 matrix uniform in JavaScript
+    const videoMatrix = new Float32Array(16 * 4);
+    // create a buffer for the uniform values
+    const videoUniformBuffer = device.createBuffer({
+        label: 'uniforms for video',
+        size: videoMatrix.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    
+    const renderPassDescriptor = {
+        label: 'our basic canvas renderPass',
+        colorAttachments: [
+            {
+                // view: <- to be filled out when we render
+                clearValue: [0.3, 0.3, 0.3, 1],
+                loadOp: 'clear',
+                storeOp: 'store',
+            },
+        ],
+    };
+    
+    function startPlayingAndWaitForVideo(video) {
+        return new Promise((resolve, reject) => {
+            video.addEventListener('error', reject);
+            if ('requestVideoFrameCallback' in video) {
+                video.requestVideoFrameCallback(resolve);
+            } else {
+                const timeWatcher = () => {
+                    if (video.currentTime > 0) {
+                        resolve();
+                    } else {
+                        requestAnimationFrame(timeWatcher);
+                    }
+                };
+                timeWatcher();
+            }
+            video.play().catch(reject);
+        });
+    }
+    
+    function waitForClick() {
+        return new Promise(resolve => {
+            window.addEventListener(
+                'click',
+                () => {
+                    document.querySelector('#start').style.display = 'none';
+                    resolve();
+                },
+                { once: true });
+        });
+    }
+    
+    const video = document.createElement('video');
+    video.muted = true;
+    video.loop = true;
+    video.preload = 'auto';
+    video.src = 'video.mp4'; 
+    await waitForClick();
+    await startPlayingAndWaitForVideo(video);
+
+    canvas.addEventListener('click', () => {
+        if (video.paused) {
+            video.play();
+        } else {
+            video.pause();
+        }
+    });
+
+    let modules = {};
+
+    // compute shader which simply copies the original video (stored in "textureIn")
+    modules[FILTER_NONE] = device.createShaderModule({
+        label: `${FILTER_NONE} shader`,
+        code: `
+            @group(0) @binding(${binding_copy_tex_in}) var textureIn: texture_external;
+            @group(0) @binding(${binding_copy_tex_out}) var textureOut: texture_storage_2d<rgba8unorm, write>;
+    
+            @compute @workgroup_size(${workgroup_size[0]},${workgroup_size[1]}) fn main_comp(
+                @builtin(global_invocation_id) id: vec3u
+            ) {
+                let uv = id.xy;
+
+                var texel = textureLoad(textureIn, uv);
+                textureStore(textureOut, uv, texel);
+            }
+        `,
+    });
+
+    // grayscale filter
+    modules["grayscale"] = device.createShaderModule({
+        label: "grayscale shader",
+        code: `
+            @group(0) @binding(${binding_copy_tex_in}) var textureIn: texture_external;
+            @group(0) @binding(${binding_copy_tex_out}) var textureOut: texture_storage_2d<rgba8unorm, write>;
+    
+            @compute @workgroup_size(${workgroup_size[0]},${workgroup_size[1]}) fn main_comp(
+                @builtin(global_invocation_id) global_id: vec3u
+            ) {
+                let texture_size = textureDimensions(textureIn).xy;
+
+                if (global_id.x >= texture_size.x || global_id.y >= texture_size.y) {
+                    return;
+                }
+
+                let origin = textureLoad(textureIn, global_id.xy); // color value
+                let grayscale = 0.48 * origin.r + 0.83 * origin.g + 0.24 * origin.b;
+
+                textureStore(
+                    textureOut, 
+                    global_id.xy, 
+                    vec4f(grayscale, grayscale, grayscale, origin.a)
+                );
+            }
+        `,
+    });
+
+    // fast gaussian filter
+    modules["gaussian filter (7x7)"] = device.createShaderModule({
+        label: "Gaussian Blur shader",
+        code: `
+            @group(0) @binding(${binding_copy_tex_in}) var textureIn: texture_external;
+            @group(0) @binding(${binding_copy_tex_out}) var textureOut: texture_storage_2d<rgba8unorm, write>;
+    
+            const gaussian_filter = array<f32, 49>(
+                0.00000067, 0.00002292, 0.00019117, 0.00038771, 0.00019117, 0.00002292, 0.00000067,
+                0.00002292, 0.00078633, 0.00655965, 0.01330373, 0.00655965, 0.00078633, 0.00002292,
+                0.00019117, 0.00665965, 0.05472157, 0.11098164, 0.05472157, 0.00655965, 0.00019117,
+                0.00038771, 0.01330373, 0.11098164, 0.22508352, 0.11098164, 0.01330373, 0.00038771,
+                0.00019117, 0.00665965, 0.05472157, 0.11098164, 0.05472157, 0.00655965, 0.00019117,
+                0.00002292, 0.00078633, 0.00655965, 0.01330373, 0.00655965, 0.00078633, 0.00002292,
+                0.00000067, 0.00002292, 0.00019117, 0.00038771, 0.00019117, 0.00002292, 0.00000067
+            );
+    
+            const group_size_x:u32  = ${workgroup_size[0]};
+            const group_size_y:u32  = ${workgroup_size[1]};
+            const shared_size_x:u32 = ${workgroup_size[0] + 6};
+            const shared_size_y:u32 = ${workgroup_size[1] + 6};
+
+            var<workgroup> shared_mem: array<
+                    array<vec4<f32>, ${workgroup_size[0] + 6}>,
+                    ${workgroup_size[1] + 6}
+                >;
+    
+            @compute @workgroup_size(${workgroup_size[0]}, ${workgroup_size[1]}, 1) fn main_comp(
+                @builtin(global_invocation_id) global_id: vec3<u32>,
+                @builtin(local_invocation_id) local_id: vec3<u32>,
+                @builtin(workgroup_id) group_id: vec3<u32>
+            ) {
+                let texture_size = textureDimensions(textureIn);
+
+                // Base position for workgroup
+                let base_x = i32(group_id.x * group_size_x) - 3;
+                let base_y = i32(group_id.y * group_size_y) - 3;
+    
+                // Each thread loads up to 4 pixels into shared memory
+                for (var i = 0u; i < 4u; i++) {
+                    let shared_x = local_id.x + (i / 2u) * group_size_x;
+                    let shared_y = local_id.y + (i % 2u) * group_size_y;
+                    
+                    if (shared_x < shared_size_x && shared_y < shared_size_y) {
+                        let load_x = base_x + i32(shared_x);
+                        let load_y = base_y + i32(shared_y);
+                        
+                        // Clamp coordinates to texture bounds
+                        let clamped_x = min(max(load_x, 0), i32(texture_size.x) - 1);
+                        let clamped_y = min(max(load_y, 0), i32(texture_size.y) - 1);
+                        
+                        shared_mem[shared_y][shared_x] = textureLoad(
+                            textureIn, 
+                            vec2<u32>(u32(clamped_x), u32(clamped_y))
+                        );
+                    }
+                }
+                
+                workgroupBarrier();
+                // Below code makes non uniform of threads, so I ordered it after workgroupBarrier()
+                if (global_id.x >= texture_size.x || global_id.y >= texture_size.y) {
+                    return;
+                }                
+    
+                // Filtering on each thread
+
+                var result = vec3<f32>(0.0, 0.0, 0.0);
+                
+                for (var y: i32 = 0; y < 7; y++) {
+                    for (var x: i32 = 0; x < 7; x++) {
+                        let pixel = shared_mem[local_id.y + u32(y)][local_id.x + u32(x)];
+                        let weight = gaussian_filter[y * 7 + x];
+                        result += pixel.rgb * weight;
+                    }
+                }
+    
+                textureStore(textureOut, global_id.xy, vec4<f32>(result, 1.0));
+            }
+        `,
+    });
+
+    // slow gaussian filter
+    modules["gaussian filter (7x7) slow"] = device.createShaderModule({
+        label: "Gaussian Blur shader",
+        code: `
+            @group(0) @binding(${binding_copy_tex_in}) var textureIn: texture_external;
+            @group(0) @binding(${binding_copy_tex_out}) var textureOut: texture_storage_2d<rgba8unorm, write>;
+
+            const gaussian_filter = array<f32, 49>(
+                0.00000067, 0.00002292, 0.00019117, 0.00038771, 0.00019117, 0.00002292, 0.00000067,
+                0.00002292, 0.00078633, 0.00655965, 0.01330373, 0.00655965, 0.00078633, 0.00002292,
+                0.00019117, 0.00665965, 0.05472157, 0.11098164, 0.05472157, 0.00655965, 0.00019117,
+                0.00038771, 0.01330373, 0.11098164, 0.22508352, 0.11098164, 0.01330373, 0.00038771,
+                0.00019117, 0.00665965, 0.05472157, 0.11098164, 0.05472157, 0.00655965, 0.00019117,
+                0.00002292, 0.00078633, 0.00655965, 0.01330373, 0.00655965, 0.00078633, 0.00002292,
+                0.00000067, 0.00002292, 0.00019117, 0.00038771, 0.00019117, 0.00002292, 0.00000067
+            );
+
+            @compute @workgroup_size(${workgroup_size[0]},${workgroup_size[1]}) fn main_comp(
+                @builtin(global_invocation_id) global_id: vec3u
+            ) {
+                let texture_size = textureDimensions(textureIn).xy;
+                
+                if (global_id.x >= texture_size.x || global_id.y >= texture_size.y) {
+                    return;
+                }
+
+                var result: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+                
+                for (var i: i32 = 0; i < 7; i++) {
+                    for (var j: i32 = 0; j < 7; j++) {
+
+                        let x       = i32(global_id.x) - 3 + i;
+                        let y       = i32(global_id.y) - 3 + j;
+                        let load_x  = min(max(x, 0), i32(texture_size.x) - 1);
+                        let load_y  = min(max(y, 0), i32(texture_size.y) - 1);
+                        let load_xy = vec2<u32>(u32(load_x), u32(load_y));
+                        
+                        let color: vec3<f32>    = textureLoad(textureIn, load_xy).rgb;
+                        let weight: f32         = gaussian_filter[i + j*7];
+
+                        result = result + color * weight;
+                    }
+                }
+
+                textureStore(textureOut, global_id.xy, vec4<f32>(result, 1.0));
+            }
+        `,
+    });
+
+    // The vertex & fragment shaders which draws a textured quad
+    const moduleTexQuad = device.createShaderModule({
+        label: 'textured quad shaders',
+        code: `
+            struct VertexInfo {
+                @builtin(position) position: vec4f,
+                @location(${loc_inter_stage_uv}) uv: vec2f
+            };
+            
+            struct Uniforms {
+                matrix: mat4x4f,
+            };
+            
+            @group(0) @binding(${binding_texquad_uniform}) var<uniform> uni: Uniforms;
+            
+            @vertex fn vs(
+                @location(${loc_position}) position: vec3f
+            ) -> VertexInfo {
+          
+                var vertexOut: VertexInfo;
+                vertexOut.position = uni.matrix * vec4f(position, 1.0);
+                vertexOut.position = vec4f(vec3f(2,-2,0.0)*position, 1.0) + vec4f(-1,1,0,0);
+                vertexOut.uv = position.xy;
+                return vertexOut;
+            }
+            
+            @group(0) @binding(${binding_texquad_sampler}) var ourSampler: sampler;
+            @group(0) @binding(${binding_texquad_tex_out}) var ourTexture: texture_2d<f32>;
+            
+            @fragment fn fs(@location(${loc_inter_stage_uv}) uv: vec2f) -> @location(0) vec4f {
+                return textureSampleBaseClampToEdge(
+                    ourTexture,
+                    ourSampler,
+                    uv,
+              );
+            }
+        `,
+    });
+
+    let pipelines = {};
+    let filters = [];
+
+    for(let filter in modules) {
+        pipelines[filter] = device.createComputePipeline({
+            label: `${filter} pipeline`,
+            layout: "auto",
+            compute: {
+                module: modules[filter],
+            },
+        });
+        filters.push(filter);
+    }
+
+    let menu = {filter:FILTER_NONE};
+
+    const gui = new GUI();
+
+    gui.add(menu, "filter", filters);
+    
+    const pipelineTexQuad = device.createRenderPipeline({
+        label: 'textured quad pipeline',
+        layout: 'auto',
+        vertex: {
+            module: moduleTexQuad,
+            buffers: [
+                {
+                    arrayStride: 8,
+                    attributes: [{
+                        format: "float32x2",
+                        offset: 0,
+                        shaderLocation: loc_position,
+                    }],
+                }
+            ],
+        },
+        fragment: {
+            module: moduleTexQuad,
+            targets: [{ format: presentationFormat }],
+        },
+    });
+    
+    const sampler = device.createSampler({
+        magFilter: 'linear',
+        minFilter: 'linear',
+    });
+ 
+    const textureOut = device.createTexture({
+        label: "processed video texture",
+        format: "rgba8unorm",
+        size: [video.videoWidth, video.videoHeight],
+        usage: GPUTextureUsage.TEXTURE_BINDING |
+               GPUTextureUsage.STORAGE_BINDING,
+    });
+
+    const bindGroupTexQuad = device.createBindGroup({
+        layout: pipelineTexQuad.getBindGroupLayout(0),
+        entries: [
+            { binding: binding_texquad_sampler, resource: sampler },
+            { binding: binding_texquad_tex_out, resource: textureOut.createView() },
+            { binding: binding_texquad_uniform, resource: { buffer: videoUniformBuffer }},
+        ],
+    });
+
+    const num_workgroups = [Math.floor((video.videoWidth  + workgroup_size[0] - 1)/workgroup_size[0]),
+                            Math.floor((video.videoHeight + workgroup_size[1] - 1)/workgroup_size[1])];
+
+
+    // vertex attributes for two triangles of a quad
+    const vertices = new Float32Array([
+        // 1st triangle
+        0, 0,
+        1, 0,
+        1, 1,
+        // 2nd triangle
+        0, 0,
+        1, 1,
+        0, 1
+    ]);
+    const vertexBuffer = device.createBuffer({
+        label:"quad vertices",
+        size: vertices.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(vertexBuffer, 0, vertices);
+
+
+    function render() {
+
+        const encoder = device.createCommandEncoder({ label: 'video processing encoder' });
+
+        // 1st pass: image processing using a compute pipeline
+        {
+            const textureIn = device.importExternalTexture({source: video});
+            
+            // We have to create a bindgroup at every frame since we're using an "external texture."
+            // See https://webgpufundamentals.org/webgpu/lessons/webgpu-textures-external-video.html
+
+            const bindGroupEntries = [
+                { binding: binding_copy_tex_in, resource: textureIn},
+                { binding: binding_copy_tex_out, resource: textureOut.createView()}, 
+            ];
+
+            const bindGroup = device.createBindGroup({
+                layout: pipelines[menu.filter].getBindGroupLayout(0),
+                entries: bindGroupEntries,
+            });
+            
+            //{ binding: binding_gaussian_filter, resource: { buffer: gaussianFilterBuffer}}
+            
+            const pass = encoder.beginComputePass();
+            
+            pass.setPipeline(pipelines[menu.filter]);
+            pass.setBindGroup(0, bindGroup);
+            //pass.dispatchWorkgroups(video.videoWidth, video.videoHeight); // I fixed it to use below line.
+            pass.dispatchWorkgroups(num_workgroups[0], num_workgroups[1]);
+            
+            pass.end();
+        }
+        
+        
+        {
+            const canvasTexture = context.getCurrentTexture().createView();
+            renderPassDescriptor.colorAttachments[0].view = canvasTexture;
+
+            const pass = encoder.beginRenderPass(renderPassDescriptor);
+            
+            // Create a matrix according to th current aspct ratio of the canvas
+            // to keep the aspect ratio of the video.
+            const canvasAspect = canvas.clientWidth / canvas.clientHeight;
+            const videoAspect = video.videoWidth / video.videoHeight;
+            const scale = canvasAspect > videoAspect
+               ? [1, canvasAspect / videoAspect, 1]
+               : [videoAspect / canvasAspect, 1, 1];
+            
+            const matrix = mat4.identity(videoMatrix);
+            mat4.scale(matrix, scale, matrix);
+            mat4.translate(matrix, [-1, 1, 0], matrix);
+            mat4.scale(matrix, [2, -2, 1], matrix);
+            
+            device.queue.writeBuffer(videoUniformBuffer, 0, videoMatrix);
+            
+            pass.setPipeline(pipelineTexQuad);
+            pass.setBindGroup(0, bindGroupTexQuad);
+            pass.setVertexBuffer(0, vertexBuffer);
+            pass.draw(6);  // call our vertex shader 6 times
+            pass.end();
+        }
+       
+        const commandBuffer = encoder.finish();
+        device.queue.submit([commandBuffer]);
+        
+        requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+
+    const observer = new ResizeObserver(entries => {
+        for (const entry of entries) {
+            const canvas = entry.target;
+            const width = entry.contentBoxSize[0].inlineSize;
+            const height = entry.contentBoxSize[0].blockSize;
+            canvas.width = Math.max(1, Math.min(width, device.limits.maxTextureDimension2D));
+            canvas.height = Math.max(1, Math.min(height, device.limits.maxTextureDimension2D));
+        }
+    });
+    observer.observe(canvas);
+}
+
+function fail(msg) {
+    alert(msg);
+}
+
+main();
+  </script>
+</html>
